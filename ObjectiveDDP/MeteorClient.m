@@ -45,7 +45,7 @@
     [self.ddp methodWithId:methodId
                     method:methodName
                 parameters:parameters];
-
+    
     return methodId;
 }
 
@@ -90,6 +90,8 @@ static BOOL userIsLoggingIn = NO;
 }
 
 - (void)logout {
+    self.userName = nil;
+    self.password = nil;
     [self sendWithMethodName:@"logout" parameters:nil];
 }
 
@@ -112,7 +114,7 @@ static int LOGON_RETRY_MAX = 5;
         }
     } else if (msg && [msg isEqualToString:@"result"]
                && message[@"result"]
-               && [message[@"result"] isKindOfClass:[NSDictionary class]]               
+               && [message[@"result"] isKindOfClass:[NSDictionary class]]
                && message[@"result"][@"B"]
                && message[@"result"][@"identity"]
                && message[@"result"][@"salt"]) {
@@ -123,7 +125,9 @@ static int LOGON_RETRY_MAX = 5;
               && [message[@"error"][@"error"]integerValue] == 403) {
         userIsLoggingIn = NO;
         if (++self.retryAttempts < LOGON_RETRY_MAX) {
-            [self logonWithUsername:self.userName password:self.password];
+            if(self.userName != nil) {
+                [self logonWithUsername:self.userName password:self.password];
+            }
         } else {
             self.retryAttempts = 0;
             [self.authDelegate authenticationFailed:message[@"error"][@"reason"]];
@@ -211,7 +215,7 @@ static int LOGON_RETRY_MAX = 5;
 - (void)makeMeteorDataSubscriptions {
     for (NSString *key in [self.subscriptions allKeys]) {
         NSString *uid = [BSONIdGenerator generate];
-        [self.subscriptions setObject:uid forKey:key];  
+        [self.subscriptions setObject:uid forKey:key];
         NSArray *params = self.subscriptionsParameters[key];
         [self.ddp subscribeWith:uid name:key parameters:params];
     }
@@ -230,35 +234,35 @@ static int LOGON_RETRY_MAX = 5;
 
 - (NSDictionary *)_parseObjectAndAddToCollection:(NSDictionary *)message {
     NSMutableDictionary *object = [NSMutableDictionary dictionaryWithDictionary:@{@"_id": message[@"id"]}];
-
+    
     for (id key in message[@"fields"]) {
         object[key] = message[@"fields"][key];
     }
-
+    
     if (!self.collections[message[@"collection"]]) {
         self.collections[message[@"collection"]] = [NSMutableArray array];
     }
-
+    
     NSMutableArray *collection = self.collections[message[@"collection"]];
-
+    
     [collection addObject:object];
-
+    
     return object;
 }
 
 - (void)_parseRemoved:(NSDictionary *)message {
     NSString *removedId = [message objectForKey:@"id"];
     int indexOfRemovedObject = 0;
-
+    
     NSMutableArray *collection = self.collections[message[@"collection"]];
-
+    
     for (NSDictionary *object in collection) {
         if ([object[@"_id"] isEqualToString:removedId]) {
             break;
         }
         indexOfRemovedObject++;
     }
-
+    
     [collection removeObjectAtIndex:indexOfRemovedObject];
 }
 
