@@ -37,12 +37,30 @@
         return;
     }
 
-    [self.meteor logonWithUsername:self.username.text password:self.password.text];
+    [self.meteor logonWithUsername:self.username.text password:self.password.text responseCallback:^(NSDictionary *response, NSError *error) {
+        if (error) {
+            [self handleFailedAuth:error];
+            return;
+        }
+        [self handleSuccessfulAuth];
+    }];
 }
 
-#pragma mark DDPAuthDelegate
+- (IBAction)didTapSayHiButton {
+    [self.meteor callMethodName:@"sayHelloTo" parameters:@[self.username.text] responseCallback:^(NSDictionary *response, NSError *error) {
+        NSString *message = response[@"result"];
+        UIAlertView *alert = [[UIAlertView alloc] initWithTitle:@"Meteor Todos"
+                                                        message:message
+                                                       delegate:nil
+                                              cancelButtonTitle:@"Great"
+                                              otherButtonTitles:nil];
+        [alert show];
+    }];
+}
 
-- (void)authenticationWasSuccessful {
+#pragma mark - Internal
+
+- (void)handleSuccessfulAuth {
     ListViewController *controller = [[ListViewController alloc] initWithNibName:@"ListViewController"
                                                                           bundle:nil
                                                                           meteor:self.meteor];
@@ -50,9 +68,9 @@
     [self.navigationController pushViewController:controller animated:YES];
 }
 
-- (void)authenticationFailed:(NSString *)reason {
+- (void)handleFailedAuth:(NSError *)error {
     UIAlertView *alert = [[UIAlertView alloc] initWithTitle:@"Meteor Todos"
-                                                    message:reason
+                                                    message:[error localizedDescription]
                                                    delegate:nil
                                           cancelButtonTitle:@"Try Again"
                                           otherButtonTitles:nil];

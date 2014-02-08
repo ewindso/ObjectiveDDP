@@ -1,4 +1,4 @@
-#import "MeteorClient.h"
+#import "MeteorClient+Private.h"
 #import "ObjectiveDDP.h"
 
 using namespace Cedar::Matchers;
@@ -24,13 +24,193 @@ describe(@"MeteorClient", ^{
         meteorClient.websocketReady should_not be_truthy;
         meteorClient.connected should_not be_truthy;
         meteorClient.collections should_not be_nil;
-        meteorClient.subscriptions should_not be_nil;
+        meteorClient->_subscriptions should_not be_nil;
+        meteorClient.authState should equal(AuthStateNoAuth);
     });
-
-    describe(@"#addSubscription:", ^{
-        context(@"when websocket is ready", ^{
+    
+    describe(@"#disconnect", ^{
+        beforeEach(^{
+            [meteorClient disconnect];
+        });
+        
+        it(@"tells ddp to disconnect", ^{
+            ddp should have_received(@selector(disconnectWebSocket));
+        });        
+    });
+    
+    describe(@"#logonWithUserParameters:username:password", ^{
+        context(@"when connected", ^{
             beforeEach(^{
-                meteorClient.websocketReady = YES;
+                meteorClient.connected = YES;
+                [meteorClient logonWithUserParameters:@{@"user": @"mrt"} username:@"mrt@ateam.com" password:@"fool" responseCallback:nil];
+            });
+            
+            it(@"sends logon message correctly", ^{
+                NSArray *sentMessages = [(id<CedarDouble>)ddp sent_messages];
+                NSInvocation *invocation = sentMessages[1];
+                NSArray *sentParameters;
+                [invocation getArgument:&sentParameters atIndex:4];
+                
+                ddp should have_received(@selector(methodWithId:method:parameters:))
+                .with(anything)
+                .and_with(@"beginPasswordExchange")
+                .and_with(anything);
+                NSDictionary *parameterDictionary = sentParameters[0];
+                [parameterDictionary allKeys] should contain(@"user");
+                parameterDictionary[@"user"] should equal(@"mrt");
+            });
+        });
+    });
+    
+    describe(@"#logonWithUsername:password:responseCallback:", ^{
+        __block NSDictionary *successResponse = nil;
+        __block NSError *errorResponse = nil;
+        
+        context(@"when connected", ^{
+            beforeEach(^{
+                meteorClient.connected = YES;
+                [meteorClient logonWithUsername:@"fox" password:@"wh4tdo1Say?" responseCallback:^(NSDictionary *response, NSError *error) {
+                    successResponse = response;
+                    errorResponse = error;
+                }];
+            });
+            
+            context(@"when the user is not already logging in", ^{
+                it(@"sends logon message correctly", ^{
+                    ddp should have_received(@selector(methodWithId:method:parameters:))
+                    .with(anything)
+                    .and_with(@"beginPasswordExchange")
+                    .and_with(anything);
+                });
+                
+                context(@"if the user tries to logon before current attempt finishes", ^{
+                    beforeEach(^{
+                        [(id<CedarDouble>)ddp reset_sent_messages];
+                        [meteorClient logonWithUsername:@"fox" password:@"wh4tdo1Say?" responseCallback:^(NSDictionary *response, NSError *error) {
+                            successResponse = response;
+                            errorResponse = error;
+                        }];
+                    });
+                    
+                    it(@"does not allow the second attempt", ^{
+                        ddp should_not have_received(@selector(methodWithId:method:parameters:));
+                    });
+                    
+                    it(@"rejects the callback with the correct error", ^{
+                        NSString *errorDesc = [NSString stringWithFormat:@"You must wait for the current logon request to finish before sending another."];
+                        NSError *expectedError = [NSError errorWithDomain:MeteorClientTransportErrorDomain code:MeteorClientErrorLogonRejected userInfo:@{NSLocalizedDescriptionKey: errorDesc}];
+                        errorResponse should equal(expectedError);
+                        successResponse should be_nil;
+                    });
+                });
+              
+                context(@"when the logon request succeeds", ^{
+                    beforeEach(^{
+                        meteorClient->_srpUser = srp_user_new(SRP_SHA256, SRP_NG_1024, "dummy", "dummy", NULL, NULL);
+                        meteorClient->_srpUser->HAMK = [@"hamk4u" cStringUsingEncoding:NSASCIIStringEncoding];
+                        [meteorClient didReceiveHAMKVerificationWithResponse:@{@"HAMK": @"hamk4u"}];
+                    });
+                    
+                    it(@"calls the response callback correctly", ^{
+                        successResponse should_not be_nil;
+                        errorResponse should be_nil;
+                    });
+                });
+            
+                context(@"when the logon request fails", ^{
+                    context(@"when max retryAttempts has been reached", ^{
+                        subjectAction(^{
+                            NSDictionary *loginErrorMessage = @{@"error": @{@"error": @403}};
+                            [meteorClient _handleLoginError:loginErrorMessage msg:@"result"];
+                        });
+                        
+                        beforeEach(^{
+                            meteorClient->_retryAttempts = 5;
+                        });
+                        
+                        it(@"calls the response callback correctly", ^{
+                            NSString *errorDesc = [NSString stringWithFormat:@"Logon failed with error %@", @403];
+                            NSError *expectedError = [NSError errorWithDomain:MeteorClientTransportErrorDomain code:MeteorClientErrorLogonRejected userInfo:@{NSLocalizedDescriptionKey: errorDesc}];
+                            errorResponse should equal(expectedError);
+                            successResponse should be_nil;
+                        });
+                    });
+                });
+            });
+        });
+        
+        context(@"when not connected", ^{
+            beforeEach(^{
+                meteorClient.connected = NO;
+                [meteorClient logonWithUsername:@"fox" password:@"wh4tdo1Say?" responseCallback:^(NSDictionary *response, NSError *error) {
+                    successResponse = response;
+                    errorResponse = error;
+                }];
+            });
+            
+            it(@"does not send", ^{
+                ddp should_not have_received(@selector(methodWithId:method:parameters:));
+            });
+            
+            it(@"rejects the callback with the correct error", ^{
+                NSString *errorDesc = [NSString stringWithFormat:@"You are not connected"];
+                NSError *expectedError = [NSError errorWithDomain:MeteorClientTransportErrorDomain code:MeteorClientErrorNotConnected userInfo:@{NSLocalizedDescriptionKey: errorDesc}];
+                errorResponse should equal(expectedError);
+                successResponse should be_nil;
+            });
+        });
+    });
+    
+    // TODO: test that invalidate handles this kind of callback, too
+    // (i.e. logging in then channel is disconnected)
+    describe(@"#logonWithUserName:password:", ^{
+        context(@"when connected", ^{
+            beforeEach(^{
+                meteorClient.connected = YES;
+                [meteorClient logonWithUsername:@"JesseJames"
+                                       password:@"shot3mUp!"];
+            });
+            
+            it(@"sends logon message correctly", ^{
+                // XXX: add custom matcher that can query the params
+                //      to see what user/pass was sent
+                ddp should have_received(@selector(methodWithId:method:parameters:))
+                .with(anything)
+                .and_with(@"beginPasswordExchange")
+                .and_with(anything);
+            });
+            
+            describe(@"#logout", ^{
+                beforeEach(^{
+                    [meteorClient logout];
+                });
+                
+                it(@"sends the logout message correctly", ^{
+                    ddp should have_received(@selector(methodWithId:method:parameters:))
+                    .with(anything)
+                    .and_with(@"logout")
+                    .and_with(anything);
+                });
+            });
+        });
+        
+        context(@"when not connected", ^{
+            beforeEach(^{
+                meteorClient.connected = NO;
+                [meteorClient logonWithUsername:@"JesseJames"
+                                       password:@"shot3mUp!"];
+            });
+            
+            it(@"does not send login message", ^{
+                ddp should_not have_received(@selector(methodWithId:method:parameters:));
+            });
+        });
+    });
+    
+    describe(@"#addSubscription:", ^{
+        context(@"when connected", ^{
+            beforeEach(^{
+                meteorClient.connected = YES;
                 [meteorClient addSubscription:@"a fancy subscription"];
             });
 
@@ -41,9 +221,9 @@ describe(@"MeteorClient", ^{
             });
         });
 
-        context(@"when websocket is not ready", ^{
+        context(@"when not connected", ^{
             beforeEach(^{
-                meteorClient.websocketReady = NO;
+                meteorClient.connected = NO;
                 [meteorClient addSubscription:@"a fancy subscription"];
             });
 
@@ -54,50 +234,53 @@ describe(@"MeteorClient", ^{
     });
 
     describe(@"#removeSubscription:", ^{
-        context(@"when the websocket is ready", ^{
+        context(@"when not connected", ^{
             beforeEach(^{
-                meteorClient.websocketReady = YES;
-                [meteorClient.subscriptions setObject:@"id1"
+                meteorClient.connected = YES;
+                [meteorClient->_subscriptions setObject:@"id1"
                                                forKey:@"fancySubscriptionName"];
-                [meteorClient.subscriptions count] should equal(1);
+                [meteorClient->_subscriptions count] should equal(1);
                 [meteorClient removeSubscription:@"fancySubscriptionName"];
             });
 
             it(@"removes subscription correctly", ^{
                 ddp should have_received(@selector(unsubscribeWith:));
-                [meteorClient.subscriptions count] should equal(0);
+                [meteorClient->_subscriptions count] should equal(0);
             });
         });
 
-        context(@"when the websocket is not ready", ^{
+        context(@"when not connected", ^{
             beforeEach(^{
-                meteorClient.websocketReady = NO;
-                [meteorClient.subscriptions setObject:@"id1"
+                meteorClient.connected = NO;
+                [meteorClient->_subscriptions setObject:@"id1"
                                                forKey:@"fancySubscriptionName"];
-                [meteorClient.subscriptions count] should equal(1);
+                [meteorClient->_subscriptions count] should equal(1);
                 [meteorClient removeSubscription:@"fancySubscriptionName"];
             });
 
             it(@"does not remove subscription", ^{
                 ddp should_not have_received(@selector(unsubscribeWith:));
-                [meteorClient.subscriptions count] should equal(1);
+                [meteorClient->_subscriptions count] should equal(1);
             });
         });
     });
 
     describe(@"#sendMethodWithName:parameters:notifyOnResponse", ^{
         __block NSString *methodId;
+        
+        subjectAction(^{
+            methodId = [meteorClient sendWithMethodName:@"awesomeMethod" parameters:@[] notifyOnResponse:YES];
+        });
 
-        context(@"when websocket is ready", ^{
+        context(@"when connected", ^{
             beforeEach(^{
-                meteorClient.websocketReady = YES;
-                [meteorClient.methodIds count] should equal(0);
-                methodId = [meteorClient sendWithMethodName:@"awesomeMethod" parameters:@[] notifyOnResponse:YES];
+                meteorClient.connected = YES;
+                [meteorClient->_methodIds count] should equal(0);
             });
 
             it(@"stores a method id", ^{
-                [meteorClient.methodIds count] should equal(1);
-                [meteorClient.methodIds allObjects][0] should equal(methodId);
+                [meteorClient->_methodIds count] should equal(1);
+                [meteorClient->_methodIds allObjects][0] should equal(methodId);
             });
 
             it(@"sends method command correctly", ^{
@@ -108,15 +291,14 @@ describe(@"MeteorClient", ^{
             });
         });
 
-        context(@"when websocket is not ready", ^{
+        context(@"when not connected", ^{
             beforeEach(^{
-                meteorClient.websocketReady = NO;
-                [meteorClient.methodIds count] should equal(0);
-                methodId = [meteorClient sendWithMethodName:@"awesomeMethod" parameters:@[] notifyOnResponse:YES];
+                meteorClient.connected = NO;
+                [meteorClient->_methodIds count] should equal(0);
             });
 
             it(@"does not store a method id", ^{
-                [meteorClient.methodIds count] should equal(0);
+                [meteorClient->_methodIds count] should equal(0);
             });
 
             it(@"does not send method command", ^{
@@ -125,53 +307,11 @@ describe(@"MeteorClient", ^{
         });
     });
 
-    describe(@"#logonWithUserName:password:", ^{
-        context(@"when websocket is ready", ^{
-            beforeEach(^{
-                meteorClient.websocketReady = YES;
-                [meteorClient logonWithUsername:@"JesseJames"
-                                       password:@"shot3mUp!"];
-            });
-
-            it(@"sends logon message correctly", ^{
-                // XXX: add custom matcher that can query the params
-                //      to see what user/pass was sent
-                ddp should have_received(@selector(methodWithId:method:parameters:))
-                    .with(anything)
-                    .and_with(@"beginPasswordExchange")
-                    .and_with(anything);
-            });
-            
-            describe(@"#logout", ^{
-                beforeEach(^{
-                    [meteorClient logout];
-                });
-                
-                it(@"sends the logout message correclty", ^{
-                    ddp should have_received(@selector(methodWithId:method:parameters:))
-                        .with(anything)
-                        .and_with(@"logout")
-                        .and_with(anything);
-                });
-            });
-        });
-
-        context(@"when websocket is NOT ready", ^{
-            beforeEach(^{
-                meteorClient.websocketReady = NO;
-                [meteorClient logonWithUsername:@"JesseJames"
-                                       password:@"shot3mUp!"];
-            });
-
-            it(@"sends logon message correctly", ^{
-                ddp should_not have_received(@selector(methodWithId:method:parameters:));
-            });
-        });
-    });
-
     describe(@"#didOpen", ^{
         beforeEach(^{
-            meteorClient.collections = [NSMutableDictionary dictionaryWithDictionary:@{@"col1": [NSArray new]}];
+            spy_on([NSNotificationCenter defaultCenter]);
+            NSArray *array = [[[NSArray alloc] init] autorelease];
+            meteorClient.collections = [NSMutableDictionary dictionaryWithDictionary:@{@"col1": array}];
             [meteorClient.collections count] should equal(1);
             [meteorClient didOpen];
         });
@@ -181,78 +321,249 @@ describe(@"MeteorClient", ^{
             [meteorClient.collections count] should equal(0);
             ddp should have_received(@selector(connectWithSession:version:support:));
         });
+
+        it(@"sends a notification", ^{
+            [NSNotificationCenter defaultCenter] should have_received(@selector(postNotificationName:object:))
+            .with(MeteorClientDidConnectNotification)
+            .and_with(meteorClient);
+        });
     });
 
     describe(@"#didReceiveConnectionClose", ^{
         beforeEach(^{
-            [meteorClient didReceiveConnectionClose];
+            meteorClient.websocketReady = YES;
+            meteorClient.connected = YES;
         });
-
-        // TODO: fix when reconnect logic is worked out
-        xit(@"resets collections and reconnects web socket", ^{
-            meteorClient.websocketReady should_not be_truthy;
-            ddp should have_received(@selector(connectWebSocket));
+        
+        context(@"when websocket is not disconnecting", ^{
+            beforeEach(^{
+                [meteorClient didReceiveConnectionClose];
+            });
+            
+            it(@"resets collections and reconnects web socket", ^{
+                meteorClient.websocketReady should_not be_truthy;
+                meteorClient.connected should_not be_truthy;
+                ddp should have_received(@selector(connectWebSocket));
+            });
+        });
+        
+        context(@"when websocket is disconnecting", ^{
+            beforeEach(^{
+                [meteorClient disconnect];
+                [meteorClient didReceiveConnectionClose];
+            });
+            
+            it(@"does not attempt to reconnect", ^{
+                ddp should_not have_received(@selector(connectWebSocket));
+            });
+        });
+    });
+    
+    describe(@"#didReceiveConnectionError", ^{
+        __block NSError *rejectError;
+        
+        beforeEach(^{
+            spy_on([NSNotificationCenter defaultCenter]);
+            meteorClient.websocketReady = YES;
+            meteorClient.connected = YES;
+            [meteorClient callMethodName:@"robots" parameters:nil responseCallback:^(NSDictionary *response, NSError *error) {
+                rejectError = error;
+            }];
+            meteorClient->_methodIds.count should equal(1);
+            meteorClient->_responseCallbacks.count should equal(1);
+        });
+        
+        context(@"when websocket is not disconnecting", ^{
+            beforeEach(^{
+                [meteorClient didReceiveConnectionError:nil];
+            });
+            
+            it(@"resets collections and reconnects web socket", ^{
+                meteorClient.websocketReady should_not be_truthy;
+                meteorClient.connected should_not be_truthy;
+                meteorClient->_methodIds.count should equal(0);
+                meteorClient->_responseCallbacks.count should equal(0);
+                ddp should have_received(@selector(connectWebSocket));
+            });
+            
+            it(@"rejects unresolved callbacks", ^{
+                NSError *expectedError = [NSError errorWithDomain:MeteorClientTransportErrorDomain code:MeteorClientErrorDisconnectedBeforeCallbackComplete userInfo:@{NSLocalizedDescriptionKey: @"You were disconnected"}];
+                rejectError should equal(expectedError);
+            });
+            
+            it(@"sends a notification", ^{
+                [NSNotificationCenter defaultCenter] should have_received(@selector(postNotificationName:object:))
+                .with(MeteorClientDidDisconnectNotification)
+                .and_with(meteorClient);
+            });
+        });
+        
+        context(@"when the websocket is disconnecting", ^{
+            beforeEach(^{
+                [meteorClient disconnect];
+                [meteorClient didReceiveConnectionError:nil];
+            });
+            
+            it(@"does not attempt to reconnect", ^{
+                ddp should_not have_received(@selector(connectWebSocket));
+            });
         });
     });
 
     describe(@"#didReceiveMessage", ^{
-        beforeEach(^{
-            spy_on([NSNotificationCenter defaultCenter]);
-        });
-
-        context(@"when called with a custom method response message", ^{
-            __block NSString *key;
-            __block NSDictionary *methodResponseMessage;
-
+        __block NSString *key;
+        
+        describe(@"RPC async method response", ^{
+            __block NSDictionary *returnedResponse;
+            __block NSError *returnedError;
+            
             beforeEach(^{
-                key = @"key1";
-                methodResponseMessage = @{
-                    @"msg": @"result",
-                    @"result": @"awesomesauce",
-                    @"id": key
-                };
-                [meteorClient.methodIds addObject:key];
-                [meteorClient didReceiveMessage:methodResponseMessage];
+                meteorClient.connected = YES;
             });
-
-            it(@"removes the message id", ^{
-                [meteorClient.methodIds containsObject:key] should_not be_truthy;
+            
+            context(@"when the response is successful", ^{
+                beforeEach(^{
+                    key = [meteorClient callMethodName:@"robots" parameters:nil responseCallback:^(NSDictionary *response, NSError *error) {
+                        returnedResponse = response;
+                    }];
+                    
+                    [meteorClient didReceiveMessage:@{@"msg": @"result",
+                                                      @"result": @"rule",
+                                                      @"id": key
+                                                     }];
+                });
+                
+                it(@"has the correct returned response", ^{
+                    returnedResponse[@"result"] should equal(@"rule");
+                });
             });
+        
+            context(@"when the response fails", ^{
+                beforeEach(^{
+                    key = [meteorClient callMethodName:@"robots" parameters:nil responseCallback:^(NSDictionary *response, NSError *error) {
+                        returnedError = error;
+                    }];
+                    [meteorClient didReceiveMessage:@{@"msg": @"result",
+                                                      @"error": @{@"errorType": @"lamesauce", @"error": @500},
+                                                      @"id": key
+                                                      }];
+                });
+                
+                it(@"has the correct returned response", ^{
+                    NSDictionary *errorDic = @{@"errorType": @"lamesauce", @"error": @500};
+                    NSDictionary *userInfo = @{NSLocalizedDescriptionKey: errorDic};
+                    NSError *expectedError = [NSError errorWithDomain:errorDic[@"errorType"] code:[errorDic[@"error"]integerValue] userInfo:userInfo];
+                    
+                    returnedError should equal(expectedError);
 
-            it(@"sends a notification", ^{
-                NSString *notificationName = [NSString stringWithFormat:@"response_%@", key];
-                [NSNotificationCenter defaultCenter] should have_received(@selector(postNotificationName:object:userInfo:))
-                    .with(notificationName)
-                    .and_with(meteorClient)
-                    .and_with(methodResponseMessage[@"result"]);
+                });
+            });
+        });
+        
+        context(@"when called with a login challenge response", ^{
+            beforeEach(^{
+                meteorClient->_srpUser = (SRPUser *)malloc(sizeof(SRPUser));
+                meteorClient->_srpUser->Astr = [@"astringy" cStringUsingEncoding:NSASCIIStringEncoding];
+                
+                meteorClient.connected = YES;
+                meteorClient->_password = @"ardv4rkz";
+                NSDictionary *challengeMessage = @{@"msg": @"result",
+                                                   @"result": @{@"B": @"bee",
+                                                                @"identity": @"ident",
+                                                                @"salt": @"pepper"}};
+                [meteorClient didReceiveMessage:challengeMessage];
+            });
+            
+            it(@"processes the message correclty", ^{
+                ddp should have_received(@selector(methodWithId:method:parameters:))
+                    .with(anything)
+                    .and_with(@"login")
+                    .and_with(anything);
+            });
+        });
+        
+        context(@"when called with an HAMK verification response", ^{
+            beforeEach(^{
+                meteorClient->_password = @"w0nky";
+                meteorClient->_srpUser = srp_user_new(SRP_SHA256, SRP_NG_1024, "dummy", "dummy", NULL, NULL);
+                meteorClient->_srpUser->HAMK = [@"hamk4u" cStringUsingEncoding:NSASCIIStringEncoding];
+                NSDictionary *verificationeMessage = @{@"msg": @"result",
+                                                       @"result": @{@"id": @"id123",
+                                                                    @"HAMK": @"hamk4u",
+                                                                    @"token": @"smokin"}};
+                [meteorClient didReceiveMessage:verificationeMessage];
+            });
+            
+            it(@"processes the message correctly", ^{
+                meteorClient->_sessionToken should equal(@"smokin");
             });
         });
 
         context(@"when called with an authentication error message", ^{
+            __block NSDictionary *authErrorMessage;
+            
             beforeEach(^{
-                NSDictionary *authErrorMessage = @{
-                    @"msg": @"result",
-                    @"error": @{@"error": @403, @"reason": @"are you kidding me?"}
-                };
-                meteorClient.retryAttempts = 5;
-                [meteorClient didReceiveMessage:authErrorMessage];
+                // assume we are in loggin in state since
+                // auth error (login reject) only occurs then
+                meteorClient.authState = AuthStateLoggingIn;
+                
+                authErrorMessage = @{@"msg": @"result",
+                                     @"error": @{@"error": @403,
+                                                 @"reason": @"are you kidding me?"}};
             });
-
-            it(@"processes the message correctly", ^{
-                meteorClient.authDelegate should have_received(@selector(authenticationFailed:)).with(@"are you kidding me?");
+            
+            context(@"before max rejects occurs", ^{
+                beforeEach(^{
+                    meteorClient->_retryAttempts = 0;
+                    meteorClient->_userName = @"mknightsham";
+                    meteorClient->_password = @"iS33de4dp33pz";
+                });
+                
+                context(@"when connected", ^{
+                    beforeEach(^{
+                        meteorClient.connected = YES;
+                        [meteorClient didReceiveMessage:authErrorMessage];
+                    });
+                    
+                    it(@"processes the message correctly", ^{
+                        meteorClient.authDelegate should_not have_received(@selector(authenticationFailed:));
+                        ddp should have_received(@selector(methodWithId:method:parameters:))
+                            .with(anything)
+                            .and_with(@"beginPasswordExchange")
+                            .and_with(anything);
+                    });
+                });
+                
+                context(@"when not connected", ^{
+                    beforeEach(^{
+                        meteorClient.connected = NO;
+                        [meteorClient didReceiveMessage:authErrorMessage];
+                    });
+                    
+                    it(@"processes the message correctly", ^{
+                        meteorClient->_retryAttempts should equal(0);
+                        meteorClient.authDelegate should have_received(@selector(authenticationFailed:)).with(@"are you kidding me?");
+                    });
+                });
+            });
+            
+            context(@"after max rejects occurs", ^{
+                beforeEach(^{
+                    meteorClient->_retryAttempts = 5;
+                    [meteorClient didReceiveMessage:authErrorMessage];
+                });
+                
+                it(@"processes the message correctly", ^{
+                    meteorClient->_retryAttempts should equal(0);
+                    meteorClient.authDelegate should have_received(@selector(authenticationFailed:)).with(@"are you kidding me?");
+                });
             });
         });
         
         context(@"when subscription is ready", ^{
             beforeEach(^{
-
-                [meteorClient.subscriptions setObject:@"subid" forKey:@"subscriptionName"];
-                
-                NSDictionary *readyMessage = @{
-                                               @"msg":@"ready",
-                                               @"subs":@[@"subid"]
-                                               };
-                
+                [meteorClient->_subscriptions setObject:@"subid" forKey:@"subscriptionName"];
+                NSDictionary *readyMessage = @{@"msg": @"ready", @"subs": @[@"subid"]};
                 [meteorClient didReceiveMessage:readyMessage];
             });
             
@@ -329,10 +640,12 @@ describe(@"MeteorClient", ^{
                 it(@"processes the message correctly", ^{
                     [meteorClient.collections[@"phrases"] count] should equal(0);
                     SEL postSel = @selector(postNotificationName:object:);
+                    SEL postObjSel = @selector(postNotificationName:object:userInfo:);
                     [NSNotificationCenter defaultCenter] should have_received(postSel).with(@"removed")
                                                                                       .and_with(meteorClient);
-                    [NSNotificationCenter defaultCenter] should have_received(postSel).with(@"phrases_removed")
-                                                                                      .and_with(meteorClient);
+                    [NSNotificationCenter defaultCenter] should have_received(postObjSel).with(@"phrases_removed")
+                                                                                         .and_with(meteorClient)
+                                                                                         .and_with(@{@"_id": @"id1"});
                 });
             });
         });
